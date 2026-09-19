@@ -245,7 +245,29 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
         if data.empty:
             continue
 
-        companies[company_name] = {"financials": data, "profile": profile_desc}
+        # Optional: a second table further down the same sheet, headed "Disclosure Item" in
+        # column A and "Status" in column B, listing that company's checklist statuses.
+        disclosures = {}
+        disc_header_idx = None
+        for i in range(len(raw)):
+            if str(raw.iloc[i, 0]).strip().lower() == "disclosure item":
+                disc_header_idx = i
+                break
+        if disc_header_idx is not None:
+            valid_statuses = {"complete", "needs review", "missing"}
+            for i in range(disc_header_idx + 1, len(raw)):
+                item = raw.iloc[i, 0]
+                status = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+                if pd.isna(item) or str(item).strip() == "":
+                    break
+                item = str(item).strip()
+                status = str(status).strip() if pd.notna(status) else ""
+                # normalize case so "complete" / "Complete" / "COMPLETE" all match
+                matched = next((s for s in ["Complete", "Needs Review", "Missing"]
+                                if s.lower() == status.lower()), None)
+                disclosures[item] = matched or "Missing"
+
+        companies[company_name] = {"financials": data, "profile": profile_desc, "disclosures": disclosures}
     return companies
 
 
@@ -773,6 +795,11 @@ elif page == "⚙️ Data Input":
             st.session_state.company["name"] = chosen_name
             if chosen["profile"]:
                 st.session_state.company["business_model"] = chosen["profile"]
+            if chosen.get("disclosures"):
+                # Only overwrite items the workbook actually specified — keep existing
+                # statuses for anything the workbook's checklist didn't mention.
+                st.session_state.disclosures.update(chosen["disclosures"])
+                st.info(f"Loaded {len(chosen['disclosures'])} disclosure statuses from the workbook too.")
             st.session_state.data_loaded = True
             st.success(f"Loaded {chosen_name}. Switch to another page from the sidebar to see it reflected.")
             st.dataframe(st.session_state.financials, use_container_width=True)
