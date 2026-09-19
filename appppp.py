@@ -57,25 +57,27 @@ if "ipo_info" not in st.session_state:
         "use_of_funds": "",
     }
 
+DEFAULT_DISCLOSURE_ITEMS = [
+    "Historical financial statements",
+    "Promoter background & shareholding",
+    "Related party transactions",
+    "Risk factors",
+    "Legal proceedings / litigations",
+    "Business description & industry overview",
+    "Use of IPO proceeds",
+    "Statutory approvals & licenses",
+    "Material contracts",
+    "Corporate governance structure",
+]
+
 if "disclosures" not in st.session_state:
     # Simple checklist: item -> status (Complete / Needs Review / Missing)
     # All start as "Missing" until real data is entered — no fake sample statuses.
-    st.session_state.disclosures = {
-        "Historical financial statements": "Missing",
-        "Promoter background & shareholding": "Missing",
-        "Related party transactions": "Missing",
-        "Risk factors": "Missing",
-        "Legal proceedings / litigations": "Missing",
-        "Business description & industry overview": "Missing",
-        "Use of IPO proceeds": "Missing",
-        "Statutory approvals & licenses": "Missing",
-        "Material contracts": "Missing",
-        "Corporate governance structure": "Missing",
-    }
+    st.session_state.disclosures = {item: "Missing" for item in DEFAULT_DISCLOSURE_ITEMS}
 
 if "companies_data" not in st.session_state:
     # Populated when the user uploads the multi-company (10-company) workbook.
-    # Maps company display name -> {"financials": DataFrame, "profile": str}
+    # Maps company display name -> {"financials": DataFrame, "profile": str, "disclosures": dict}
     st.session_state.companies_data = {}
 
 if "data_loaded" not in st.session_state:
@@ -195,7 +197,14 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
     with 'Company'), each with a title row, a header row starting with 'Year',
     and one data row per financial year. Figures are assumed to be in plain
     rupees and converted to ₹ crore (divide by 1e7) unless rupees_to_crore=False.
-    Returns {company_name: {"financials": DataFrame, "profile": str}}.
+
+    Each sheet may optionally also include a disclosure checklist table anywhere
+    below the financial data, with a header row starting with "Disclosure Item"
+    in column A and "Status" in column B, followed by up to 10 rows of
+    item/status pairs. If no such table is found, all 10 standard items default
+    to "Missing" for that company.
+
+    Returns {company_name: {"financials": DataFrame, "profile": str, "disclosures": dict}}.
     """
     xls = pd.ExcelFile(file)
     companies = {}
@@ -245,7 +254,25 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
         if data.empty:
             continue
 
-        companies[company_name] = {"financials": data, "profile": profile_desc}
+        # Optional disclosure checklist table, anywhere below the financial data.
+        sheet_disclosures = {item: "Missing" for item in DEFAULT_DISCLOSURE_ITEMS}
+        valid_statuses = {"complete", "needs review", "missing"}
+        for i in range(len(raw)):
+            if str(raw.iloc[i, 0]).strip().lower() == "disclosure item":
+                for j in range(i + 1, min(i + 1 + len(DEFAULT_DISCLOSURE_ITEMS), len(raw))):
+                    item_cell = str(raw.iloc[j, 0]).strip()
+                    status_cell = str(raw.iloc[j, 1]).strip() if raw.shape[1] > 1 else ""
+                    if not item_cell or item_cell.lower() == "nan":
+                        break
+                    matched_key = next((k for k in sheet_disclosures if k.lower() == item_cell.lower()), None)
+                    if matched_key and status_cell.lower() in valid_statuses:
+                        # Normalize to the exact casing used in DEFAULT_DISCLOSURE_ITEMS options.
+                        sheet_disclosures[matched_key] = next(
+                            s for s in ["Complete", "Needs Review", "Missing"] if s.lower() == status_cell.lower()
+                        )
+                break
+
+        companies[company_name] = {"financials": data, "profile": profile_desc, "disclosures": sheet_disclosures}
     return companies
 
 
@@ -511,6 +538,20 @@ elif page == "⚠️ Gap & Risk Detector":
     c2.metric("🟡 Needs Review", review)
     c3.metric("🔴 Missing", missing)
 
+    bulk_a, bulk_b, bulk_c = st.columns(3)
+    if bulk_a.button("Mark all Complete"):
+        for item in st.session_state.disclosures:
+            st.session_state.disclosures[item] = "Complete"
+        st.rerun()
+    if bulk_b.button("Mark all Needs Review"):
+        for item in st.session_state.disclosures:
+            st.session_state.disclosures[item] = "Needs Review"
+        st.rerun()
+    if bulk_c.button("Reset all to Missing"):
+        for item in st.session_state.disclosures:
+            st.session_state.disclosures[item] = "Missing"
+        st.rerun()
+
     status_options = ["Complete", "Needs Review", "Missing"]
     for item in list(st.session_state.disclosures.keys()):
         current = st.session_state.disclosures[item]
@@ -730,7 +771,10 @@ elif page == "⚙️ Data Input":
     st.subheader("📤 Option 1: Upload 10-Company Workbook")
     st.caption(
         "Upload the multi-sheet Excel workbook (one tab per company, tabs named 'Company 1', 'Company 2', "
-        "etc.). Figures are read as plain rupees and auto-converted to ₹ crore."
+        "etc.). Figures are read as plain rupees and auto-converted to ₹ crore. Optionally, below the "
+        "financial data on each sheet, add a table starting with 'Disclosure Item' in column A and "
+        "'Status' in column B, followed by up to 10 rows (item, status) — status must be one of "
+        "Complete / Needs Review / Missing. If omitted, all 10 items default to Missing for that company."
     )
     multi_file = st.file_uploader("Upload the 10-company Excel workbook", type=["xlsx"], key="multi_company_upload")
     if multi_file is not None:
@@ -757,8 +801,12 @@ elif page == "⚙️ Data Input":
             st.session_state.company["name"] = chosen_name
             if chosen["profile"]:
                 st.session_state.company["business_model"] = chosen["profile"]
+            st.session_state.disclosures = dict(
+                chosen.get("disclosures", {item: "Missing" for item in DEFAULT_DISCLOSURE_ITEMS})
+            )
             st.session_state.data_loaded = True
-            st.success(f"Loaded {chosen_name}. Switch to another page from the sidebar to see it reflected.")
+            st.success(f"Loaded {chosen_name} — including its disclosure checklist. "
+                        f"Switch to another page from the sidebar to see it reflected.")
             st.dataframe(st.session_state.financials, use_container_width=True)
 
     st.divider()
