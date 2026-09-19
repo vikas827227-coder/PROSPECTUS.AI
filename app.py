@@ -57,27 +57,25 @@ if "ipo_info" not in st.session_state:
         "use_of_funds": "",
     }
 
-DEFAULT_DISCLOSURE_ITEMS = [
-    "Historical financial statements",
-    "Promoter background & shareholding",
-    "Related party transactions",
-    "Risk factors",
-    "Legal proceedings / litigations",
-    "Business description & industry overview",
-    "Use of IPO proceeds",
-    "Statutory approvals & licenses",
-    "Material contracts",
-    "Corporate governance structure",
-]
-
 if "disclosures" not in st.session_state:
     # Simple checklist: item -> status (Complete / Needs Review / Missing)
     # All start as "Missing" until real data is entered — no fake sample statuses.
-    st.session_state.disclosures = {item: "Missing" for item in DEFAULT_DISCLOSURE_ITEMS}
+    st.session_state.disclosures = {
+        "Historical financial statements": "Missing",
+        "Promoter background & shareholding": "Missing",
+        "Related party transactions": "Missing",
+        "Risk factors": "Missing",
+        "Legal proceedings / litigations": "Missing",
+        "Business description & industry overview": "Missing",
+        "Use of IPO proceeds": "Missing",
+        "Statutory approvals & licenses": "Missing",
+        "Material contracts": "Missing",
+        "Corporate governance structure": "Missing",
+    }
 
 if "companies_data" not in st.session_state:
     # Populated when the user uploads the multi-company (10-company) workbook.
-    # Maps company display name -> {"financials": DataFrame, "profile": str, "disclosures": dict}
+    # Maps company display name -> {"financials": DataFrame, "profile": str}
     st.session_state.companies_data = {}
 
 if "data_loaded" not in st.session_state:
@@ -197,14 +195,7 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
     with 'Company'), each with a title row, a header row starting with 'Year',
     and one data row per financial year. Figures are assumed to be in plain
     rupees and converted to ₹ crore (divide by 1e7) unless rupees_to_crore=False.
-
-    Each sheet may optionally also include a disclosure checklist table anywhere
-    below the financial data, with a header row starting with "Disclosure Item"
-    in column A and "Status" in column B, followed by up to 10 rows of
-    item/status pairs. If no such table is found, all 10 standard items default
-    to "Missing" for that company.
-
-    Returns {company_name: {"financials": DataFrame, "profile": str, "disclosures": dict}}.
+    Returns {company_name: {"financials": DataFrame, "profile": str}}.
     """
     xls = pd.ExcelFile(file)
     companies = {}
@@ -254,25 +245,7 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
         if data.empty:
             continue
 
-        # Optional disclosure checklist table, anywhere below the financial data.
-        sheet_disclosures = {item: "Missing" for item in DEFAULT_DISCLOSURE_ITEMS}
-        valid_statuses = {"complete", "needs review", "missing"}
-        for i in range(len(raw)):
-            if str(raw.iloc[i, 0]).strip().lower() == "disclosure item":
-                for j in range(i + 1, min(i + 1 + len(DEFAULT_DISCLOSURE_ITEMS), len(raw))):
-                    item_cell = str(raw.iloc[j, 0]).strip()
-                    status_cell = str(raw.iloc[j, 1]).strip() if raw.shape[1] > 1 else ""
-                    if not item_cell or item_cell.lower() == "nan":
-                        break
-                    matched_key = next((k for k in sheet_disclosures if k.lower() == item_cell.lower()), None)
-                    if matched_key and status_cell.lower() in valid_statuses:
-                        # Normalize to the exact casing used in DEFAULT_DISCLOSURE_ITEMS options.
-                        sheet_disclosures[matched_key] = next(
-                            s for s in ["Complete", "Needs Review", "Missing"] if s.lower() == status_cell.lower()
-                        )
-                break
-
-        companies[company_name] = {"financials": data, "profile": profile_desc, "disclosures": sheet_disclosures}
+        companies[company_name] = {"financials": data, "profile": profile_desc}
     return companies
 
 
@@ -342,24 +315,31 @@ def interpret_ratio(name: str, value: float) -> tuple[str, str]:
 # IPO READINESS SCORE
 # ----------------------------------------------------------------------
 def compute_readiness_score(ratios_latest: pd.Series, disclosures: dict) -> dict:
-    def clamp(x, lo=0, hi=100):
-        return max(lo, min(hi, x))
+    has_financial_data = pd.notna(ratios_latest["Revenue"]) and ratios_latest["Revenue"] > 0
 
-    # Financial Health (0-100) — continuous, based on margin, growth, leverage, interest coverage
-    de = ratios_latest["Debt-to-Equity"]
-    npm = ratios_latest["Net Profit Margin %"]
-    rev_growth = ratios_latest["Revenue Growth %"]
-    int_cov = ratios_latest["Interest Coverage"]
-
-    de_score = clamp(100 - (de if pd.notna(de) else 0) * 40)          # 0x->100, 1x->60, 2.5x->0
-    npm_score = clamp((npm if pd.notna(npm) else 0) * 6)               # 0%->0, ~16.7%->100
-    growth_score = clamp(50 + (rev_growth if pd.notna(rev_growth) else 0) * 2)  # 0%->50, 25%->100, -25%->0
-    cov_score = clamp((int_cov if pd.notna(int_cov) else 0) * 15) if pd.notna(int_cov) else 50  # 0x->0, ~6.7x->100
-
-    fin_score = round((de_score + npm_score + growth_score + cov_score) / 4)
+    # Financial Health (0-100) — based on margin, growth, leverage
+    if not has_financial_data:
+        fin_score = 0
+    else:
+        fin_score = 100
+        if ratios_latest["Debt-to-Equity"] > 2:
+            fin_score -= 25
+        elif ratios_latest["Debt-to-Equity"] > 1:
+            fin_score -= 10
+        if ratios_latest["Net Profit Margin %"] < 5:
+            fin_score -= 20
+        elif ratios_latest["Net Profit Margin %"] < 10:
+            fin_score -= 8
+        if ratios_latest["Revenue Growth %"] < 0:
+            fin_score -= 20
+        elif ratios_latest["Revenue Growth %"] < 10:
+            fin_score -= 8
+        if ratios_latest["Interest Coverage"] < 2:
+            fin_score -= 15
+        fin_score = max(0, fin_score)
 
     # Financial Consistency — placeholder tied to cross-check status (filled in later)
-    consistency_score = st.session_state.get("consistency_score_cache", 90)
+    consistency_score = st.session_state.get("consistency_score_cache", 0)
 
     # Disclosure Completeness
     total = len(disclosures)
@@ -367,19 +347,27 @@ def compute_readiness_score(ratios_latest: pd.Series, disclosures: dict) -> dict
     needs_review = sum(1 for v in disclosures.values() if v == "Needs Review")
     disclosure_score = round((complete * 1.0 + needs_review * 0.5) / total * 100)
 
-    # Debt & Risk — continuous
-    recv_days = ratios_latest["Receivable Days"]
-    recv_score = clamp(100 - (recv_days if pd.notna(recv_days) else 0) * 0.6)  # 90 days -> 46, 150 days -> 10
-    debt_score = round((de_score + recv_score) / 2)
+    # Debt & Risk
+    if not has_financial_data:
+        debt_score = 0
+    else:
+        debt_score = 100
+        if ratios_latest["Debt-to-Equity"] > 2:
+            debt_score -= 30
+        elif ratios_latest["Debt-to-Equity"] > 1:
+            debt_score -= 10
+        if ratios_latest["Receivable Days"] > 90:
+            debt_score -= 15
+        debt_score = max(0, debt_score)
 
     # Corporate Information — proxy: are promoter/company fields filled
     corp_fields = [st.session_state.company["name"], st.session_state.company["industry"],
                    st.session_state.company["promoter_names"]]
-    corp_score = round(sum(1 for f in corp_fields if f.strip()) / len(corp_fields) * 100) if any(corp_fields) else 60
+    corp_score = round(sum(1 for f in corp_fields if f.strip()) / len(corp_fields) * 100) if any(corp_fields) else 0
 
     # IPO Preparation — proxy: whether issue size / use of funds filled
     ipo_fields = [st.session_state.ipo_info["issue_size"], st.session_state.ipo_info["use_of_funds"]]
-    prep_score = 80 if st.session_state.ipo_info["use_of_funds"].strip() else 50
+    prep_score = 80 if st.session_state.ipo_info["use_of_funds"].strip() else 0
 
     categories = {
         "Financial Health": fin_score,
@@ -414,7 +402,7 @@ cc["Status"] = cc["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "�
 mismatches = cc[cc["Status"] == "🚨 Mismatch"]
 st.session_state["consistency_score_cache"] = round(
     (len(cc) - len(mismatches)) / len(cc) * 100
-) if len(cc) else 100
+) if len(cc) else 0
 
 score = compute_readiness_score(latest, st.session_state.disclosures)
 
@@ -444,11 +432,12 @@ if page == "🏠 Dashboard":
             value=score["overall"],
             title={"text": "IPO Readiness Score"},
             gauge={"axis": {"range": [0, 100]},
-                   "bar": {"color": "darkblue"},
+                   "bar": {"color": "#F0F921"},  # bright plasma yellow needle/bar
+                   "bgcolor": "#0D0887",  # deep plasma purple background
                    "steps": [
-                       {"range": [0, 50], "color": "#f8d7da"},
-                       {"range": [50, 75], "color": "#fff3cd"},
-                       {"range": [75, 100], "color": "#d4edda"}]}))
+                       {"range": [0, 50], "color": "#0D0887"},   # dark purple
+                       {"range": [50, 75], "color": "#CC4778"},  # magenta/pink
+                       {"range": [75, 100], "color": "#F89441"}]}))  # vibrant orange
         st.plotly_chart(fig, use_container_width=True)
     with c2:
         cat_df = pd.DataFrame(list(score["categories"].items()), columns=["Category", "Score"])
@@ -537,20 +526,6 @@ elif page == "⚠️ Gap & Risk Detector":
     c1.metric("🟢 Complete", complete)
     c2.metric("🟡 Needs Review", review)
     c3.metric("🔴 Missing", missing)
-
-    bulk_a, bulk_b, bulk_c = st.columns(3)
-    if bulk_a.button("Mark all Complete"):
-        for item in st.session_state.disclosures:
-            st.session_state.disclosures[item] = "Complete"
-        st.rerun()
-    if bulk_b.button("Mark all Needs Review"):
-        for item in st.session_state.disclosures:
-            st.session_state.disclosures[item] = "Needs Review"
-        st.rerun()
-    if bulk_c.button("Reset all to Missing"):
-        for item in st.session_state.disclosures:
-            st.session_state.disclosures[item] = "Missing"
-        st.rerun()
 
     status_options = ["Complete", "Needs Review", "Missing"]
     for item in list(st.session_state.disclosures.keys()):
@@ -771,10 +746,7 @@ elif page == "⚙️ Data Input":
     st.subheader("📤 Option 1: Upload 10-Company Workbook")
     st.caption(
         "Upload the multi-sheet Excel workbook (one tab per company, tabs named 'Company 1', 'Company 2', "
-        "etc.). Figures are read as plain rupees and auto-converted to ₹ crore. Optionally, below the "
-        "financial data on each sheet, add a table starting with 'Disclosure Item' in column A and "
-        "'Status' in column B, followed by up to 10 rows (item, status) — status must be one of "
-        "Complete / Needs Review / Missing. If omitted, all 10 items default to Missing for that company."
+        "etc.). Figures are read as plain rupees and auto-converted to ₹ crore."
     )
     multi_file = st.file_uploader("Upload the 10-company Excel workbook", type=["xlsx"], key="multi_company_upload")
     if multi_file is not None:
@@ -801,12 +773,8 @@ elif page == "⚙️ Data Input":
             st.session_state.company["name"] = chosen_name
             if chosen["profile"]:
                 st.session_state.company["business_model"] = chosen["profile"]
-            st.session_state.disclosures = dict(
-                chosen.get("disclosures", {item: "Missing" for item in DEFAULT_DISCLOSURE_ITEMS})
-            )
             st.session_state.data_loaded = True
-            st.success(f"Loaded {chosen_name} — including its disclosure checklist. "
-                        f"Switch to another page from the sidebar to see it reflected.")
+            st.success(f"Loaded {chosen_name}. Switch to another page from the sidebar to see it reflected.")
             st.dataframe(st.session_state.financials, use_container_width=True)
 
     st.divider()
@@ -814,17 +782,14 @@ elif page == "⚙️ Data Input":
     st.caption(
         "Upload a CSV or Excel file with one company's financial data. "
         "The file must have these exact column headers: Year, Revenue, EBITDA, PAT, Assets, Liabilities, "
-        "Equity, Debt, Cash, Receivables, Inventory, InterestExpense — one row per financial year. "
-        "You can optionally add IssueSize, FreshIssue, OfferForSale columns (₹ Cr) — if present, the "
-        "latest year's values are used to auto-fill the IPO issue structure."
+        "Equity, Debt, Cash, Receivables, Inventory, InterestExpense — one row per financial year."
     )
 
     template_csv = (
-        "Year,Revenue,EBITDA,PAT,Assets,Liabilities,Equity,Debt,Cash,Receivables,Inventory,InterestExpense,"
-        "IssueSize,FreshIssue,OfferForSale\n"
-        "FY24,35,6,3,40,20,20,12,4,6,5,1.4,,,\n"
-        "FY25,42,7.5,3.4,48,24,24,15,5,8,6,1.7,,,\n"
-        "FY26,50,9,4,55,28,27,18,5.5,11,7,2.1,60,40,20\n"
+        "Year,Revenue,EBITDA,PAT,Assets,Liabilities,Equity,Debt,Cash,Receivables,Inventory,InterestExpense\n"
+        "FY24,35,6,3,40,20,20,12,4,6,5,1.4\n"
+        "FY25,42,7.5,3.4,48,24,24,15,5,8,6,1.7\n"
+        "FY26,50,9,4,55,28,27,18,5.5,11,7,2.1\n"
     )
     st.download_button(
         "⬇️ Download blank template (CSV)",
@@ -843,7 +808,6 @@ elif page == "⚙️ Data Input":
 
             required_cols = ["Year", "Revenue", "EBITDA", "PAT", "Assets", "Liabilities",
                               "Equity", "Debt", "Cash", "Receivables", "Inventory", "InterestExpense"]
-            optional_ipo_cols = ["IssueSize", "FreshIssue", "OfferForSale"]
             missing = [c for c in required_cols if c not in new_df.columns]
             if missing:
                 st.error(f"Your file is missing these columns: {', '.join(missing)}. "
@@ -851,17 +815,6 @@ elif page == "⚙️ Data Input":
             else:
                 st.session_state.financials = new_df[required_cols].reset_index(drop=True)
                 st.session_state.data_loaded = True
-
-                present_ipo_cols = [c for c in optional_ipo_cols if c in new_df.columns]
-                if present_ipo_cols:
-                    latest_row = new_df.iloc[-1]
-                    col_to_key = {"IssueSize": "issue_size", "FreshIssue": "fresh_issue",
-                                  "OfferForSale": "offer_for_sale"}
-                    for col in present_ipo_cols:
-                        val = pd.to_numeric(latest_row[col], errors="coerce")
-                        if pd.notna(val):
-                            st.session_state.ipo_info[col_to_key[col]] = float(val)
-
                 st.success(f"Loaded {len(new_df)} year(s) of data from {uploaded_file.name}. "
                             f"Switch to another page from the sidebar to see it reflected.")
                 st.dataframe(st.session_state.financials, use_container_width=True)
