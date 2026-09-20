@@ -183,19 +183,155 @@ def build_draft_docx(comp: dict, ipo: dict, fin_table: pd.DataFrame, risk_items:
 
 
 # ----------------------------------------------------------------------
-# MULTI-COMPANY WORKBOOK PARSER
+# SHARED SHEET PARSER (used by both single-company and multi-company uploads)
 # ----------------------------------------------------------------------
 REQUIRED_FIN_COLS = ["Year", "Revenue", "EBITDA", "PAT", "Assets", "Liabilities",
                      "Equity", "Debt", "Cash", "Receivables", "Inventory", "InterestExpense"]
 
 
+def _find_row(raw: pd.DataFrame, label: str):
+    """Returns the row index where column A matches `label` (case-insensitive), or None."""
+    for i in range(len(raw)):
+        if str(raw.iloc[i, 0]).strip().lower() == label.lower():
+            return i
+    return None
+
+
+def parse_company_sheet(raw: pd.DataFrame, rupees_to_crore: bool = True) -> dict:
+    """
+    Parses ONE sheet containing everything for one company:
+      - Row 1: title, format "Company Name — sample profile: one-line description"
+      - A financial table headed by a "Year" row (required)
+      - Optional "Disclosure Item" / "Status" table
+      - Optional "IPO Info" key/value table (IssueSize, FreshIssue, OfferForSale, UseOfFunds)
+      - Optional "Company Info" key/value table (Industry, YearsOfOperation, Employees,
+        Locations, PromoterNames)
+      - Optional "Cross Check" table with Field / Entered Value / Document Value columns
+    Returns a dict with keys: name, profile, financials, disclosures, ipo_info,
+    company_info, cross_check — any section not found is left as an empty dict/DataFrame.
+    """
+    result = {
+        "name": "", "profile": "", "financials": None, "disclosures": {},
+        "ipo_info": {}, "company_info": {}, "cross_check": None,
+    }
+    if raw.empty:
+        return result
+
+    title_cell = str(raw.iloc[0, 0])
+    if "—" in title_cell:
+        name_part, profile_part = title_cell.split("—", 1)
+    elif " - " in title_cell:
+        name_part, profile_part = title_cell.split(" - ", 1)
+    else:
+        name_part, profile_part = title_cell, ""
+    result["name"] = name_part.strip()
+    result["profile"] = profile_part.replace("sample profile:", "").strip()
+
+    # --- Financial table (required) ---
+    header_row_idx = _find_row(raw, "year")
+    if header_row_idx is not None:
+        headers = [str(h).strip() for h in raw.iloc[header_row_idx].tolist()]
+        data_rows = []
+        for i in range(header_row_idx + 1, len(raw)):
+            year_cell = raw.iloc[i, 0]
+            if pd.isna(year_cell) or str(year_cell).strip() == "":
+                break  # stop at the first blank row — don't swallow later sections
+            data_rows.append(raw.iloc[i].tolist())
+        if data_rows:
+            data = pd.DataFrame(data_rows, columns=headers)
+            missing = [c for c in REQUIRED_FIN_COLS if c not in data.columns]
+            if not missing:
+                numeric_cols = [c for c in REQUIRED_FIN_COLS if c != "Year"]
+                for c in numeric_cols:
+                    data[c] = pd.to_numeric(data[c], errors="coerce")
+                    if rupees_to_crore:
+                        data[c] = data[c] / 1e7  # plain rupees -> ₹ crore
+                data["Year"] = data["Year"].astype(str)
+                data = data[REQUIRED_FIN_COLS].dropna(subset=numeric_cols, how="all").reset_index(drop=True)
+                if not data.empty:
+                    result["financials"] = data
+
+    # --- Disclosure checklist (optional) ---
+    disc_header_idx = _find_row(raw, "disclosure item")
+    if disc_header_idx is not None:
+        for i in range(disc_header_idx + 1, len(raw)):
+            item = raw.iloc[i, 0]
+            status = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+            if pd.isna(item) or str(item).strip() == "":
+                break
+            item = str(item).strip()
+            status = str(status).strip() if pd.notna(status) else ""
+            matched = next((s for s in ["Complete", "Needs Review", "Missing"]
+                            if s.lower() == status.lower()), None)
+            result["disclosures"][item] = matched or "Missing"
+
+    # --- IPO Info key/value table (optional) ---
+    ipo_header_idx = _find_row(raw, "ipo info")
+    if ipo_header_idx is not None:
+        ipo_keys = {"issuesize": "issue_size", "freshissue": "fresh_issue",
+                    "offerforsale": "offer_for_sale", "useoffunds": "use_of_funds"}
+        for i in range(ipo_header_idx + 1, len(raw)):
+            key_cell = raw.iloc[i, 0]
+            val_cell = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+            if pd.isna(key_cell) or str(key_cell).strip() == "":
+                break
+            key_norm = str(key_cell).strip().lower().replace(" ", "").replace("_", "")
+            if key_norm in ipo_keys:
+                target = ipo_keys[key_norm]
+                if target == "use_of_funds":
+                    result["ipo_info"][target] = str(val_cell).strip() if pd.notna(val_cell) else ""
+                else:
+                    result["ipo_info"][target] = float(val_cell) if pd.notna(val_cell) else 0.0
+
+    # --- Company Info key/value table (optional) ---
+    comp_header_idx = _find_row(raw, "company info")
+    if comp_header_idx is not None:
+        comp_keys = {"industry": "industry", "yearsofoperation": "years_of_operation",
+                     "employees": "employees", "locations": "locations",
+                     "promoternames": "promoter_names"}
+        for i in range(comp_header_idx + 1, len(raw)):
+            key_cell = raw.iloc[i, 0]
+            val_cell = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+            if pd.isna(key_cell) or str(key_cell).strip() == "":
+                break
+            key_norm = str(key_cell).strip().lower().replace(" ", "").replace("_", "")
+            if key_norm in comp_keys:
+                target = comp_keys[key_norm]
+                if target in ("years_of_operation", "employees"):
+                    result["company_info"][target] = int(val_cell) if pd.notna(val_cell) else 0
+                else:
+                    result["company_info"][target] = str(val_cell).strip() if pd.notna(val_cell) else ""
+
+    # --- Cross-check table (optional) ---
+    cross_header_idx = _find_row(raw, "cross check")
+    if cross_header_idx is not None:
+        col_header_idx = cross_header_idx + 1
+        rows = []
+        for i in range(col_header_idx + 1, len(raw)):
+            field = raw.iloc[i, 0]
+            entered = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+            document = raw.iloc[i, 2] if raw.shape[1] > 2 else None
+            if pd.isna(field) or str(field).strip() == "":
+                break
+            rows.append({
+                "Field": str(field).strip(),
+                "Entered Value": float(entered) if pd.notna(entered) else 0.0,
+                "Document Value": float(document) if pd.notna(document) else 0.0,
+            })
+        if rows:
+            result["cross_check"] = pd.DataFrame(rows)
+
+    return result
+
+
 def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
     """
     Parses a workbook containing one sheet per company (sheet names starting
-    with 'Company'), each with a title row, a header row starting with 'Year',
-    and one data row per financial year. Figures are assumed to be in plain
-    rupees and converted to ₹ crore (divide by 1e7) unless rupees_to_crore=False.
-    Returns {company_name: {"financials": DataFrame, "profile": str}}.
+    with 'Company'). Each sheet is parsed with parse_company_sheet, which reads
+    financials plus any optional Disclosure/IPO Info/Company Info/Cross Check
+    sections present on that same sheet.
+    Returns {company_name: {"financials", "profile", "disclosures", "ipo_info",
+    "company_info", "cross_check"}}.
     """
     xls = pd.ExcelFile(file)
     companies = {}
@@ -203,87 +339,24 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
         if not sheet.strip().lower().startswith("company"):
             continue
         raw = pd.read_excel(xls, sheet, header=None)
-        if raw.empty:
+        parsed = parse_company_sheet(raw, rupees_to_crore=rupees_to_crore)
+        if parsed["financials"] is None:
             continue
-
-        title_cell = str(raw.iloc[0, 0])
-        if "—" in title_cell:
-            name_part, profile_part = title_cell.split("—", 1)
-        elif " - " in title_cell:
-            name_part, profile_part = title_cell.split(" - ", 1)
-        else:
-            name_part, profile_part = title_cell, ""
-        company_name = name_part.strip() or sheet.strip()
-        profile_desc = profile_part.replace("sample profile:", "").strip()
-
-        header_row_idx = None
-        for i in range(len(raw)):
-            if str(raw.iloc[i, 0]).strip().lower() == "year":
-                header_row_idx = i
-                break
-        if header_row_idx is None:
-            continue
-
-        headers = [str(h).strip() for h in raw.iloc[header_row_idx].tolist()]
-        data = raw.iloc[header_row_idx + 1:].copy()
-        data.columns = headers
-        data = data.dropna(subset=["Year"], how="any")
-        if data.empty:
-            continue
-
-        missing = [c for c in REQUIRED_FIN_COLS if c not in data.columns]
-        if missing:
-            continue
-
-        numeric_cols = [c for c in REQUIRED_FIN_COLS if c != "Year"]
-        for c in numeric_cols:
-            data[c] = pd.to_numeric(data[c], errors="coerce")
-            if rupees_to_crore:
-                data[c] = data[c] / 1e7  # plain rupees -> ₹ crore
-        data["Year"] = data["Year"].astype(str)
-        data = data[REQUIRED_FIN_COLS].dropna(subset=numeric_cols, how="all").reset_index(drop=True)
-        if data.empty:
-            continue
-
-        # Optional: a second table further down the same sheet, headed "Disclosure Item" in
-        # column A and "Status" in column B, listing that company's checklist statuses.
-        disclosures = {}
-        disc_header_idx = None
-        for i in range(len(raw)):
-            if str(raw.iloc[i, 0]).strip().lower() == "disclosure item":
-                disc_header_idx = i
-                break
-        if disc_header_idx is not None:
-            valid_statuses = {"complete", "needs review", "missing"}
-            for i in range(disc_header_idx + 1, len(raw)):
-                item = raw.iloc[i, 0]
-                status = raw.iloc[i, 1] if raw.shape[1] > 1 else None
-                if pd.isna(item) or str(item).strip() == "":
-                    break
-                item = str(item).strip()
-                status = str(status).strip() if pd.notna(status) else ""
-                # normalize case so "complete" / "Complete" / "COMPLETE" all match
-                matched = next((s for s in ["Complete", "Needs Review", "Missing"]
-                                if s.lower() == status.lower()), None)
-                disclosures[item] = matched or "Missing"
-
-        companies[company_name] = {"financials": data, "profile": profile_desc, "disclosures": disclosures}
+        company_name = parsed["name"] or sheet.strip()
+        companies[company_name] = {
+            "financials": parsed["financials"],
+            "profile": parsed["profile"],
+            "disclosures": parsed["disclosures"],
+            "ipo_info": parsed["ipo_info"],
+            "company_info": parsed["company_info"],
+            "cross_check": parsed["cross_check"],
+        }
     return companies
 
 
 # ----------------------------------------------------------------------
 # FINANCIAL ENGINE
 # ----------------------------------------------------------------------
-def clean_cross_check(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop blank/incomplete rows (e.g. the empty placeholder row a dynamic data_editor
-    always shows) so they never get scored or flagged as a 'nan' mismatch."""
-    out = df.copy()
-    out["Field"] = out["Field"].astype("string")
-    has_field = out["Field"].notna() & (out["Field"].str.strip() != "")
-    has_values = out["Entered Value"].notna() & out["Document Value"].notna()
-    return out[has_field & has_values].reset_index(drop=True)
-
-
 def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     """Element-wise division that returns NaN instead of inf/-inf when the denominator is 0."""
     result = numerator / denominator.replace(0, pd.NA)
@@ -428,7 +501,7 @@ ratios = compute_ratios(st.session_state.financials)
 latest = ratios.iloc[-1]
 
 # Consistency check (used by readiness score + gap detector)
-cc = clean_cross_check(st.session_state.cross_check)
+cc = st.session_state.cross_check.copy()
 cc["Difference"] = (cc["Entered Value"] - cc["Document Value"]).abs()
 cc["Status"] = cc["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
 mismatches = cc[cc["Status"] == "🚨 Mismatch"]
@@ -576,55 +649,28 @@ elif page == "⚠️ Gap & Risk Detector":
     st.divider()
     st.subheader("🚨 Inconsistency Detector")
     st.caption(
-        "This is a **data-entry cross-check**, not a benchmark or target comparison — it checks that a "
-        "figure matches across two sources of the same historical fact:\n\n"
-        "- **Field** — the line item you're checking, e.g. `FY26 Revenue` or `FY26 Debt`.\n"
-        "- **Entered Value** — the number you already entered for that field in **⚙️ Data Input** (₹ Cr). "
-        "Not a benchmark or target — just the figure currently sitting in this app.\n"
-        "- **Document** — the same figure as it actually appears in the real source document "
-        "(financial statements, auditor's report, bank statement, RHP draft, etc.), in ₹ Cr.\n\n"
-        "*Example:* Field = `FY26 Revenue`, Entered Value = `50`, Document = `48` → flagged as a mismatch "
-        "of ₹2 Cr for you to verify."
+        "Enter the same figure as it appears in two different places — what you typed into the system "
+        "vs. what an uploaded document shows — and this table flags any mismatch automatically."
     )
     edited_cc = st.data_editor(
-        st.session_state.cross_check, num_rows="dynamic", use_container_width=True, key="gap_cross_check_editor",
-        column_config={
-            "Field": st.column_config.TextColumn(
-                "Field",
-                help="The line item you're cross-checking — e.g. 'FY26 Revenue' or 'FY26 Debt'.",
-            ),
-            "Entered Value": st.column_config.NumberColumn(
-                "Entered Value",
-                help="The figure you already entered for this field in ⚙️ Data Input (₹ Cr) — "
-                     "not a benchmark or target, just what's currently in the app.",
-            ),
-            "Document Value": st.column_config.NumberColumn(
-                "Document",
-                help="The same figure as it appears in the actual source document (financial "
-                     "statements, auditor's report, bank statement, etc.), in ₹ Cr.",
-            ),
-        },
+        st.session_state.cross_check, num_rows="dynamic", use_container_width=True, key="gap_cross_check_editor"
     )
     st.session_state.cross_check = edited_cc
 
-    cc_live = clean_cross_check(edited_cc)
+    cc_live = edited_cc.copy()
+    cc_live["Difference"] = (cc_live["Entered Value"] - cc_live["Document Value"]).abs()
+    cc_live["Status"] = cc_live["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
+    live_mismatches = cc_live[cc_live["Status"] == "🚨 Mismatch"]
 
-    if cc_live.empty:
-        st.info("Add a field name plus both an entered value and a document value to check for mismatches.")
+    if len(live_mismatches):
+        for _, row in live_mismatches.iterrows():
+            st.error(
+                f"Potential inconsistency in **{row['Field']}**: entered ₹{row['Entered Value']} Cr "
+                f"vs document ₹{row['Document Value']} Cr (difference ₹{row['Difference']:.1f} Cr). "
+                f"Status: Requires verification."
+            )
     else:
-        cc_live["Difference"] = (cc_live["Entered Value"] - cc_live["Document Value"]).abs()
-        cc_live["Status"] = cc_live["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
-        live_mismatches = cc_live[cc_live["Status"] == "🚨 Mismatch"]
-
-        if len(live_mismatches):
-            for _, row in live_mismatches.iterrows():
-                st.error(
-                    f"Potential inconsistency in **{row['Field']}**: entered ₹{row['Entered Value']} Cr "
-                    f"vs document ₹{row['Document Value']} Cr (difference ₹{row['Difference']:.1f} Cr). "
-                    f"Status: Requires verification."
-                )
-        else:
-            st.success("No inconsistencies detected across the checked fields.")
+        st.success("No inconsistencies detected across the checked fields.")
 
 
 # ----------------------------------------------------------------------
@@ -797,15 +843,69 @@ elif page == "🧪 What-If Simulator":
 elif page == "⚙️ Data Input":
     st.title("⚙️ Company & Financial Data Input")
     st.caption(
-        "Upload your company's data below (CSV/Excel), or use manual entry further down for anything "
-        "an upload doesn't cover, or if you don't have a file to upload."
+        "Upload your company's data below — either a 10-company workbook or a single company's file. "
+        "Manual entry is available further down for anything an upload doesn't cover, or if you don't "
+        "have a file to upload."
     )
 
-    st.subheader("📤 Upload a Single Company's Data (CSV/Excel)")
+    st.subheader("📤 Option 1: Banker/Auditor View — Compare Multiple Companies")
     st.caption(
-        "Upload a CSV or Excel file with one company's financial data. "
-        "The file must have these exact column headers: Year, Revenue, EBITDA, PAT, Assets, Liabilities, "
-        "Equity, Debt, Cash, Receivables, Inventory, InterestExpense — one row per financial year."
+        "For merchant bankers, auditors, or due-diligence teams screening several SME clients at once. "
+        "Upload the multi-sheet Excel workbook (one tab per company, tabs named 'Company 1', 'Company 2', "
+        "etc.). Figures are read as plain rupees and auto-converted to ₹ crore. "
+        "*(An individual SME promoter checking only their own company should use Option 2 below instead.)*"
+    )
+    multi_file = st.file_uploader("Upload the 10-company Excel workbook", type=["xlsx"], key="multi_company_upload")
+    if multi_file is not None:
+        try:
+            parsed = parse_multi_company_workbook(multi_file)
+            if not parsed:
+                st.error("No valid 'Company' sheets found. Check that each tab has a 'Year' header row "
+                          "and the required columns.")
+            else:
+                st.session_state.companies_data = parsed
+                st.success(f"Loaded {len(parsed)} companies: {', '.join(parsed.keys())}")
+        except Exception as e:
+            st.error(f"Couldn't read that workbook: {e}")
+
+    if st.session_state.companies_data:
+        chosen_name = st.selectbox(
+            "Select a company to load into the app",
+            list(st.session_state.companies_data.keys()),
+            key="company_selector",
+        )
+        if st.button("Load selected company into the app", type="primary"):
+            chosen = st.session_state.companies_data[chosen_name]
+            st.session_state.financials = chosen["financials"].copy()
+            st.session_state.company["name"] = chosen_name
+            if chosen["profile"]:
+                st.session_state.company["business_model"] = chosen["profile"]
+            extras_loaded = []
+            if chosen.get("disclosures"):
+                st.session_state.disclosures.update(chosen["disclosures"])
+                extras_loaded.append(f"{len(chosen['disclosures'])} disclosure statuses")
+            if chosen.get("ipo_info"):
+                st.session_state.ipo_info.update(chosen["ipo_info"])
+                extras_loaded.append("IPO info")
+            if chosen.get("company_info"):
+                st.session_state.company.update(chosen["company_info"])
+                extras_loaded.append("company info")
+            if chosen.get("cross_check") is not None and not chosen["cross_check"].empty:
+                st.session_state.cross_check = chosen["cross_check"].copy()
+                extras_loaded.append(f"{len(chosen['cross_check'])} cross-check rows")
+            if extras_loaded:
+                st.info(f"Also loaded from the workbook: {', '.join(extras_loaded)}.")
+            st.session_state.data_loaded = True
+            st.success(f"Loaded {chosen_name}. Switch to another page from the sidebar to see it reflected.")
+            st.dataframe(st.session_state.financials, use_container_width=True)
+
+    st.divider()
+    st.subheader("📤 Option 2: Upload a Single Company's Data (CSV/Excel)")
+    st.caption(
+        "For an individual SME checking its own IPO readiness. "
+        "A CSV needs just the 12-column financial table below. An Excel (.xlsx) file can include "
+        "everything the app uses in one sheet — company info, IPO info, 10 years of financials, "
+        "the disclosure checklist, and the cross-check table. See the format guide below."
     )
 
     template_csv = (
@@ -815,78 +915,76 @@ elif page == "⚙️ Data Input":
         "FY26,50,9,4,55,28,27,18,5.5,11,7,2.1\n"
     )
     st.download_button(
-        "⬇️ Download blank template (CSV)",
+        "⬇️ Download blank CSV template (financials only)",
         data=template_csv,
         file_name="company_financials_template.csv",
         mime="text/csv",
     )
 
-    uploaded_file = st.file_uploader("Upload financial data", type=["csv", "xlsx"])
+    with st.expander("📋 Full Excel format guide (everything in one sheet)"):
+        st.markdown(
+            "Row 1: `Company Name — sample profile: one-line description`\n\n"
+            "Then, anywhere below (any order, one blank row between sections):\n\n"
+            "**Financial table** — header row starting with `Year`, followed by columns "
+            "`Revenue, EBITDA, PAT, Assets, Liabilities, Equity, Debt, Cash, Receivables, "
+            "Inventory, InterestExpense` — one row per year, values in plain rupees.\n\n"
+            "**Company Info** — a row with `Company Info` in column A, then key/value rows below it: "
+            "`Industry`, `YearsOfOperation`, `Employees`, `Locations`, `PromoterNames`.\n\n"
+            "**IPO Info** — a row with `IPO Info` in column A, then key/value rows: "
+            "`IssueSize`, `FreshIssue`, `OfferForSale`, `UseOfFunds` (values in ₹ crore).\n\n"
+            "**Disclosure Item** — a row with `Disclosure Item` | `Status` as headers, then one row "
+            "per checklist item with a status of Complete / Needs Review / Missing.\n\n"
+            "**Cross Check** — a row with `Cross Check` in column A, then a header row "
+            "`Field | Entered Value | Document Value`, then one row per figure being compared "
+            "(values in ₹ crore)."
+        )
+
+    uploaded_file = st.file_uploader("Upload company data", type=["csv", "xlsx"])
     if uploaded_file is not None:
         try:
             if uploaded_file.name.endswith(".csv"):
                 new_df = pd.read_csv(uploaded_file)
+                required_cols = ["Year", "Revenue", "EBITDA", "PAT", "Assets", "Liabilities",
+                                  "Equity", "Debt", "Cash", "Receivables", "Inventory", "InterestExpense"]
+                missing = [c for c in required_cols if c not in new_df.columns]
+                if missing:
+                    st.error(f"Your file is missing these columns: {', '.join(missing)}. "
+                              f"Use the template above to check the exact spelling.")
+                else:
+                    st.session_state.financials = new_df[required_cols].reset_index(drop=True)
+                    st.session_state.data_loaded = True
+                    st.success(f"Loaded {len(new_df)} year(s) of financial data from {uploaded_file.name}.")
+                    st.dataframe(st.session_state.financials, use_container_width=True)
             else:
-                new_df = pd.read_excel(uploaded_file)
-
-            required_cols = ["Year", "Revenue", "EBITDA", "PAT", "Assets", "Liabilities",
-                              "Equity", "Debt", "Cash", "Receivables", "Inventory", "InterestExpense"]
-            missing = [c for c in required_cols if c not in new_df.columns]
-            if missing:
-                st.error(f"Your file is missing these columns: {', '.join(missing)}. "
-                          f"Use the template above to check the exact spelling.")
-            else:
-                st.session_state.financials = new_df[required_cols].reset_index(drop=True)
-                st.session_state.data_loaded = True
-                st.success(f"Loaded {len(new_df)} year(s) of data from {uploaded_file.name}. "
-                            f"Switch to another page from the sidebar to see it reflected.")
-                st.dataframe(st.session_state.financials, use_container_width=True)
+                raw = pd.read_excel(uploaded_file, sheet_name=0, header=None)
+                parsed = parse_company_sheet(raw)
+                if parsed["financials"] is None:
+                    st.error("Couldn't find a valid financial table (a row starting with 'Year' "
+                              "followed by the required columns). Check the format guide above.")
+                else:
+                    st.session_state.financials = parsed["financials"]
+                    if parsed["name"]:
+                        st.session_state.company["name"] = parsed["name"]
+                    if parsed["profile"]:
+                        st.session_state.company["business_model"] = parsed["profile"]
+                    loaded_extras = ["financial data"]
+                    if parsed["company_info"]:
+                        st.session_state.company.update(parsed["company_info"])
+                        loaded_extras.append("company info")
+                    if parsed["ipo_info"]:
+                        st.session_state.ipo_info.update(parsed["ipo_info"])
+                        loaded_extras.append("IPO info")
+                    if parsed["disclosures"]:
+                        st.session_state.disclosures.update(parsed["disclosures"])
+                        loaded_extras.append(f"{len(parsed['disclosures'])} disclosure statuses")
+                    if parsed["cross_check"] is not None and not parsed["cross_check"].empty:
+                        st.session_state.cross_check = parsed["cross_check"]
+                        loaded_extras.append(f"{len(parsed['cross_check'])} cross-check rows")
+                    st.session_state.data_loaded = True
+                    st.success(f"Loaded from {uploaded_file.name}: {', '.join(loaded_extras)}.")
+                    st.dataframe(st.session_state.financials, use_container_width=True)
         except Exception as e:
             st.error(f"Couldn't read that file: {e}")
-
-    st.divider()
-    with st.expander("🏦 Banker / Advisor Mode — Screen Multiple Companies (for due diligence use)"):
-        st.caption(
-            "This mode is for **bankers, auditors, or due-diligence teams** comparing several candidate "
-            "companies at once — not for a company checking its own readiness (use the single-company "
-            "upload above for that). Upload the multi-sheet Excel workbook (one tab per company, tabs "
-            "named 'Company 1', 'Company 2', etc.) and pick one company from it to load into the app."
-        )
-        multi_file = st.file_uploader(
-            "Upload the multi-company Excel workbook", type=["xlsx"], key="multi_company_upload"
-        )
-        if multi_file is not None:
-            try:
-                parsed = parse_multi_company_workbook(multi_file)
-                if not parsed:
-                    st.error("No valid 'Company' sheets found. Check that each tab has a 'Year' header row "
-                              "and the required columns.")
-                else:
-                    st.session_state.companies_data = parsed
-                    st.success(f"Loaded {len(parsed)} companies: {', '.join(parsed.keys())}")
-            except Exception as e:
-                st.error(f"Couldn't read that workbook: {e}")
-
-        if st.session_state.companies_data:
-            chosen_name = st.selectbox(
-                "Select a company to load into the app",
-                list(st.session_state.companies_data.keys()),
-                key="company_selector",
-            )
-            if st.button("Load selected company into the app", type="primary"):
-                chosen = st.session_state.companies_data[chosen_name]
-                st.session_state.financials = chosen["financials"].copy()
-                st.session_state.company["name"] = chosen_name
-                if chosen["profile"]:
-                    st.session_state.company["business_model"] = chosen["profile"]
-                if chosen.get("disclosures"):
-                    # Only overwrite items the workbook actually specified — keep existing
-                    # statuses for anything the workbook's checklist didn't mention.
-                    st.session_state.disclosures.update(chosen["disclosures"])
-                    st.info(f"Loaded {len(chosen['disclosures'])} disclosure statuses from the workbook too.")
-                st.session_state.data_loaded = True
-                st.success(f"Loaded {chosen_name}. Switch to another page from the sidebar to see it reflected.")
-                st.dataframe(st.session_state.financials, use_container_width=True)
 
     st.divider()
     with st.expander("✏️ Manually enter or edit company, IPO & financial details (optional)"):
