@@ -357,6 +357,16 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
 # ----------------------------------------------------------------------
 # FINANCIAL ENGINE
 # ----------------------------------------------------------------------
+def clean_cross_check(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop blank/incomplete rows (e.g. the empty placeholder row a dynamic data_editor
+    always shows) so they never get scored or flagged as a 'nan' mismatch."""
+    out = df.copy()
+    out["Field"] = out["Field"].astype("string")
+    has_field = out["Field"].notna() & (out["Field"].str.strip() != "")
+    has_values = out["Entered Value"].notna() & out["Document Value"].notna()
+    return out[has_field & has_values].reset_index(drop=True)
+
+
 def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     """Element-wise division that returns NaN instead of inf/-inf when the denominator is 0."""
     result = numerator / denominator.replace(0, pd.NA)
@@ -501,7 +511,7 @@ ratios = compute_ratios(st.session_state.financials)
 latest = ratios.iloc[-1]
 
 # Consistency check (used by readiness score + gap detector)
-cc = st.session_state.cross_check.copy()
+cc = clean_cross_check(st.session_state.cross_check)
 cc["Difference"] = (cc["Entered Value"] - cc["Document Value"]).abs()
 cc["Status"] = cc["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
 mismatches = cc[cc["Status"] == "🚨 Mismatch"]
@@ -649,28 +659,55 @@ elif page == "⚠️ Gap & Risk Detector":
     st.divider()
     st.subheader("🚨 Inconsistency Detector")
     st.caption(
-        "Enter the same figure as it appears in two different places — what you typed into the system "
-        "vs. what an uploaded document shows — and this table flags any mismatch automatically."
+        "This is a **data-entry cross-check**, not a benchmark or target comparison — it checks that a "
+        "figure matches across two sources of the same historical fact:\n\n"
+        "- **Field** — the line item you're checking, e.g. `FY26 Revenue` or `FY26 Debt`.\n"
+        "- **Entered Value** — the number you already entered for that field in **⚙️ Data Input** (₹ Cr). "
+        "Not a benchmark or target — just the figure currently sitting in this app.\n"
+        "- **Document** — the same figure as it actually appears in the real source document "
+        "(financial statements, auditor's report, bank statement, RHP draft, etc.), in ₹ Cr.\n\n"
+        "*Example:* Field = `FY26 Revenue`, Entered Value = `50`, Document = `48` → flagged as a mismatch "
+        "of ₹2 Cr for you to verify."
     )
     edited_cc = st.data_editor(
-        st.session_state.cross_check, num_rows="dynamic", use_container_width=True, key="gap_cross_check_editor"
+        st.session_state.cross_check, num_rows="dynamic", use_container_width=True, key="gap_cross_check_editor",
+        column_config={
+            "Field": st.column_config.TextColumn(
+                "Field",
+                help="The line item you're cross-checking — e.g. 'FY26 Revenue' or 'FY26 Debt'.",
+            ),
+            "Entered Value": st.column_config.NumberColumn(
+                "Entered Value",
+                help="The figure you already entered for this field in ⚙️ Data Input (₹ Cr) — "
+                     "not a benchmark or target, just what's currently in the app.",
+            ),
+            "Document Value": st.column_config.NumberColumn(
+                "Document",
+                help="The same figure as it appears in the actual source document (financial "
+                     "statements, auditor's report, bank statement, etc.), in ₹ Cr.",
+            ),
+        },
     )
     st.session_state.cross_check = edited_cc
 
-    cc_live = edited_cc.copy()
-    cc_live["Difference"] = (cc_live["Entered Value"] - cc_live["Document Value"]).abs()
-    cc_live["Status"] = cc_live["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
-    live_mismatches = cc_live[cc_live["Status"] == "🚨 Mismatch"]
+    cc_live = clean_cross_check(edited_cc)
 
-    if len(live_mismatches):
-        for _, row in live_mismatches.iterrows():
-            st.error(
-                f"Potential inconsistency in **{row['Field']}**: entered ₹{row['Entered Value']} Cr "
-                f"vs document ₹{row['Document Value']} Cr (difference ₹{row['Difference']:.1f} Cr). "
-                f"Status: Requires verification."
-            )
+    if cc_live.empty:
+        st.info("Add a field name plus both an entered value and a document value to check for mismatches.")
     else:
-        st.success("No inconsistencies detected across the checked fields.")
+        cc_live["Difference"] = (cc_live["Entered Value"] - cc_live["Document Value"]).abs()
+        cc_live["Status"] = cc_live["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
+        live_mismatches = cc_live[cc_live["Status"] == "🚨 Mismatch"]
+
+        if len(live_mismatches):
+            for _, row in live_mismatches.iterrows():
+                st.error(
+                    f"Potential inconsistency in **{row['Field']}**: entered ₹{row['Entered Value']} Cr "
+                    f"vs document ₹{row['Document Value']} Cr (difference ₹{row['Difference']:.1f} Cr). "
+                    f"Status: Requires verification."
+                )
+        else:
+            st.success("No inconsistencies detected across the checked fields.")
 
 
 # ----------------------------------------------------------------------
