@@ -78,6 +78,36 @@ if "companies_data" not in st.session_state:
     # Maps company display name -> {"financials": DataFrame, "profile": str}
     st.session_state.companies_data = {}
 
+if "legal_compliance" not in st.session_state:
+    # Self-reported legal/compliance flags. "No" is the good answer for all of these.
+    st.session_state.legal_compliance = {
+        "Pending litigation against the company": "Not disclosed",
+        "Unresolved tax disputes": "Not disclosed",
+        "Past regulatory violations / SEBI action": "Not disclosed",
+        "Related-party transactions properly disclosed": "Not disclosed",
+    }
+
+if "governance_info" not in st.session_state:
+    st.session_state.governance_info = {
+        "auditor_name": "",
+        "auditor_is_reputable": "Not disclosed",  # Yes / No / Not disclosed
+        "independent_directors_pct": 0,
+        "audit_committee_exists": "Not disclosed",
+        "qualified_audit_opinion_last3yrs": "Not disclosed",  # "No" is good
+    }
+
+if "industry_risk" not in st.session_state:
+    st.session_state.industry_risk = {
+        "top_customer_concentration_pct": 0,  # % of revenue from largest single customer
+        "key_regulatory_license_status": "Not disclosed",  # Obtained / Pending / Not Applicable / Not disclosed
+        "market_sentiment": "Not assessed",  # Favorable / Neutral / Unfavorable / Not assessed — informational only
+    }
+
+if "valuation_info" not in st.session_state:
+    st.session_state.valuation_info = {
+        "peer_pe_multiple": 0.0,
+    }
+
 if "data_loaded" not in st.session_state:
     # False until the user uploads a workbook/file or enters real data.
     st.session_state.data_loaded = False
@@ -213,6 +243,7 @@ def parse_company_sheet(raw: pd.DataFrame, rupees_to_crore: bool = True) -> dict
     result = {
         "name": "", "profile": "", "financials": None, "disclosures": {},
         "ipo_info": {}, "company_info": {}, "cross_check": None,
+        "legal_compliance": {}, "governance_info": {}, "industry_risk": {}, "valuation_info": {},
     }
     if raw.empty:
         return result
@@ -321,6 +352,87 @@ def parse_company_sheet(raw: pd.DataFrame, rupees_to_crore: bool = True) -> dict
         if rows:
             result["cross_check"] = pd.DataFrame(rows)
 
+    # --- Legal Info key/value table (optional) ---
+    legal_header_idx = _find_row(raw, "legal info")
+    if legal_header_idx is not None:
+        legal_keys = {
+            "pendinglitigation": "Pending litigation against the company",
+            "taxdisputes": "Unresolved tax disputes",
+            "regulatoryviolations": "Past regulatory violations / SEBI action",
+            "relatedpartydisclosed": "Related-party transactions properly disclosed",
+        }
+        for i in range(legal_header_idx + 1, len(raw)):
+            key_cell = raw.iloc[i, 0]
+            val_cell = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+            if pd.isna(key_cell) or str(key_cell).strip() == "":
+                break
+            key_norm = str(key_cell).strip().lower().replace(" ", "").replace("_", "")
+            if key_norm in legal_keys:
+                val = str(val_cell).strip() if pd.notna(val_cell) else "Not disclosed"
+                matched = next((s for s in ["Yes", "No", "Not disclosed"] if s.lower() == val.lower()), "Not disclosed")
+                result["legal_compliance"][legal_keys[key_norm]] = matched
+
+    # --- Governance Info key/value table (optional) ---
+    gov_header_idx = _find_row(raw, "governance info")
+    if gov_header_idx is not None:
+        for i in range(gov_header_idx + 1, len(raw)):
+            key_cell = raw.iloc[i, 0]
+            val_cell = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+            if pd.isna(key_cell) or str(key_cell).strip() == "":
+                break
+            key_norm = str(key_cell).strip().lower().replace(" ", "").replace("_", "")
+            yn_options = ["Yes", "No", "Not disclosed"]
+            if key_norm == "auditorname":
+                result["governance_info"]["auditor_name"] = str(val_cell).strip() if pd.notna(val_cell) else ""
+            elif key_norm == "auditorreputable":
+                val = str(val_cell).strip() if pd.notna(val_cell) else "Not disclosed"
+                result["governance_info"]["auditor_is_reputable"] = next(
+                    (s for s in yn_options if s.lower() == val.lower()), "Not disclosed")
+            elif key_norm == "independentdirectorspct":
+                result["governance_info"]["independent_directors_pct"] = int(val_cell) if pd.notna(val_cell) else 0
+            elif key_norm == "auditcommittee":
+                val = str(val_cell).strip() if pd.notna(val_cell) else "Not disclosed"
+                result["governance_info"]["audit_committee_exists"] = next(
+                    (s for s in yn_options if s.lower() == val.lower()), "Not disclosed")
+            elif key_norm == "qualifiedopinion":
+                val = str(val_cell).strip() if pd.notna(val_cell) else "Not disclosed"
+                result["governance_info"]["qualified_audit_opinion_last3yrs"] = next(
+                    (s for s in yn_options if s.lower() == val.lower()), "Not disclosed")
+
+    # --- Industry Risk key/value table (optional) ---
+    ind_header_idx = _find_row(raw, "industry risk")
+    if ind_header_idx is not None:
+        for i in range(ind_header_idx + 1, len(raw)):
+            key_cell = raw.iloc[i, 0]
+            val_cell = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+            if pd.isna(key_cell) or str(key_cell).strip() == "":
+                break
+            key_norm = str(key_cell).strip().lower().replace(" ", "").replace("_", "")
+            if key_norm == "customerconcentrationpct":
+                result["industry_risk"]["top_customer_concentration_pct"] = int(val_cell) if pd.notna(val_cell) else 0
+            elif key_norm == "regulatorylicensestatus":
+                val = str(val_cell).strip() if pd.notna(val_cell) else "Not disclosed"
+                options = ["Obtained", "Pending", "Not Applicable", "Not disclosed"]
+                result["industry_risk"]["key_regulatory_license_status"] = next(
+                    (s for s in options if s.lower() == val.lower()), "Not disclosed")
+            elif key_norm == "marketsentiment":
+                val = str(val_cell).strip() if pd.notna(val_cell) else "Not assessed"
+                options = ["Favorable", "Neutral", "Unfavorable", "Not assessed"]
+                result["industry_risk"]["market_sentiment"] = next(
+                    (s for s in options if s.lower() == val.lower()), "Not assessed")
+
+    # --- Valuation Info key/value table (optional) ---
+    val_header_idx = _find_row(raw, "valuation info")
+    if val_header_idx is not None:
+        for i in range(val_header_idx + 1, len(raw)):
+            key_cell = raw.iloc[i, 0]
+            val_cell = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+            if pd.isna(key_cell) or str(key_cell).strip() == "":
+                break
+            key_norm = str(key_cell).strip().lower().replace(" ", "").replace("_", "")
+            if key_norm == "peerpemultiple":
+                result["valuation_info"]["peer_pe_multiple"] = float(val_cell) if pd.notna(val_cell) else 0.0
+
     return result
 
 
@@ -350,6 +462,10 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
             "ipo_info": parsed["ipo_info"],
             "company_info": parsed["company_info"],
             "cross_check": parsed["cross_check"],
+            "legal_compliance": parsed.get("legal_compliance", {}),
+            "governance_info": parsed.get("governance_info", {}),
+            "industry_risk": parsed.get("industry_risk", {}),
+            "valuation_info": parsed.get("valuation_info", {}),
         }
     return companies
 
@@ -357,16 +473,6 @@ def parse_multi_company_workbook(file, rupees_to_crore: bool = True) -> dict:
 # ----------------------------------------------------------------------
 # FINANCIAL ENGINE
 # ----------------------------------------------------------------------
-def clean_cross_check(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop blank/incomplete rows (e.g. the empty placeholder row a dynamic data_editor
-    always shows) so they never get scored or flagged as a 'nan' mismatch."""
-    out = df.copy()
-    out["Field"] = out["Field"].astype("string")
-    has_field = out["Field"].notna() & (out["Field"].str.strip() != "")
-    has_values = out["Entered Value"].notna() & out["Document Value"].notna()
-    return out[has_field & has_values].reset_index(drop=True)
-
-
 def _safe_div(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     """Element-wise division that returns NaN instead of inf/-inf when the denominator is 0."""
     result = numerator / denominator.replace(0, pd.NA)
@@ -484,16 +590,110 @@ def compute_readiness_score(ratios_latest: pd.Series, disclosures: dict) -> dict
     ipo_fields = [st.session_state.ipo_info["issue_size"], st.session_state.ipo_info["use_of_funds"]]
     prep_score = 80 if st.session_state.ipo_info["use_of_funds"].strip() else 0
 
-    categories = {
+    # Legal & Compliance — self-reported flags; "No" is the good answer for the first 3,
+    # "Yes" is good for the 4th (related-party disclosure). Unanswered items count as unresolved.
+    legal = st.session_state.legal_compliance
+    legal_points = 0
+    good_answers = {
+        "Pending litigation against the company": "No",
+        "Unresolved tax disputes": "No",
+        "Past regulatory violations / SEBI action": "No",
+        "Related-party transactions properly disclosed": "Yes",
+    }
+    for item, good_answer in good_answers.items():
+        if legal.get(item) == good_answer:
+            legal_points += 1
+    legal_score = round(legal_points / len(good_answers) * 100) if any(v != "Not disclosed" for v in legal.values()) else 0
+
+    # Governance & Auditor Quality
+    gov = st.session_state.governance_info
+    if not any([gov["auditor_name"].strip(), gov["auditor_is_reputable"] != "Not disclosed",
+                gov["audit_committee_exists"] != "Not disclosed", gov["independent_directors_pct"] > 0]):
+        gov_score = 0
+    else:
+        gov_score = 100
+        if gov["auditor_is_reputable"] != "Yes":
+            gov_score -= 25
+        if gov["audit_committee_exists"] != "Yes":
+            gov_score -= 25
+        if gov["independent_directors_pct"] < 33:
+            gov_score -= 25
+        if gov["qualified_audit_opinion_last3yrs"] == "Yes":
+            gov_score -= 25
+        gov_score = max(0, gov_score)
+
+    # Each category has its own maximum points (weights sum to 100), reflecting that
+    # some factors matter more than others for IPO readiness — not a flat average.
+    category_weights = {
+        "Financial Health": 25,
+        "Debt & Risk": 20,
+        "Disclosure Completeness": 15,
+        "Legal & Compliance": 15,
+        "Governance & Auditor Quality": 10,
+        "Financial Consistency": 5,
+        "Corporate Information": 5,
+        "IPO Preparation": 5,
+    }
+    raw_scores = {
         "Financial Health": fin_score,
         "Financial Consistency": consistency_score,
         "Disclosure Completeness": disclosure_score,
         "Debt & Risk": debt_score,
         "Corporate Information": corp_score,
         "IPO Preparation": prep_score,
+        "Legal & Compliance": legal_score,
+        "Governance & Auditor Quality": gov_score,
     }
-    overall = round(sum(categories.values()) / len(categories))
-    return {"overall": overall, "categories": categories}
+    # Convert each 0-100 raw score into points out of that category's own max weight
+    categories = {
+        name: round(raw_scores[name] / 100 * max_points)
+        for name, max_points in category_weights.items()
+    }
+    category_max = category_weights
+    overall = sum(categories.values())  # already out of 100, since weights sum to 100
+    return {"overall": overall, "categories": categories, "category_max": category_max}
+
+
+def check_sebi_eligibility(financials: pd.DataFrame, ratios: pd.DataFrame) -> list:
+    """
+    A pass/fail table against a few of SEBI's actual, commonly-cited SME IPO eligibility
+    criteria — NOT the full legal requirement list (see the caption on the page that uses
+    this), just the handful that can be checked directly from financial statements.
+    """
+    checks = []
+    if financials.empty or financials["Revenue"].fillna(0).sum() == 0:
+        return [{"Requirement": "No financial data entered yet", "Company Value": "—", "Status": "⚪ N/A"}]
+
+    last3 = ratios.tail(3)
+    positive_years = (last3["PAT"] > 0).sum()
+    checks.append({
+        "Requirement": "Positive PAT in at least 2 of the last 3 years",
+        "Company Value": f"{positive_years} of {len(last3)} year(s) positive",
+        "Status": "✅ Pass" if positive_years >= 2 else "❌ Fail",
+    })
+
+    latest_networth = ratios.iloc[-1]["Equity"]
+    checks.append({
+        "Requirement": "Positive net worth (Equity)",
+        "Company Value": f"₹{latest_networth:.1f} Cr",
+        "Status": "✅ Pass" if pd.notna(latest_networth) and latest_networth > 0 else "❌ Fail",
+    })
+
+    net_tangible_assets = ratios.iloc[-1]["Assets"]
+    checks.append({
+        "Requirement": "Net Tangible Assets ≥ ₹3 crore (SME IPO minimum, illustrative)",
+        "Company Value": f"₹{net_tangible_assets:.1f} Cr",
+        "Status": "✅ Pass" if pd.notna(net_tangible_assets) and net_tangible_assets >= 3 else "❌ Fail",
+    })
+
+    latest_debt_equity = ratios.iloc[-1]["Debt-to-Equity"]
+    checks.append({
+        "Requirement": "Debt-to-Equity below 3x (general prudence guideline, not a hard SEBI rule)",
+        "Company Value": f"{latest_debt_equity:.2f}x" if pd.notna(latest_debt_equity) else "N/A",
+        "Status": "✅ Pass" if pd.isna(latest_debt_equity) or latest_debt_equity < 3 else "❌ Fail",
+    })
+
+    return checks
 
 
 # ----------------------------------------------------------------------
@@ -504,14 +704,14 @@ st.sidebar.caption("Prepare. Detect. Simulate. Go Public.")
 page = st.sidebar.radio(
     "Navigate",
     ["🏠 Dashboard", "📊 Financial Health", "🔍 IPO Readiness", "⚠️ Gap & Risk Detector",
-     "📄 Draft Generator", "🧪 What-If Simulator", "⚙️ Data Input"],
+     "⚖️ Legal, Governance & Valuation", "📄 Draft Generator", "🧪 What-If Simulator", "⚙️ Data Input"],
 )
 
 ratios = compute_ratios(st.session_state.financials)
 latest = ratios.iloc[-1]
 
 # Consistency check (used by readiness score + gap detector)
-cc = clean_cross_check(st.session_state.cross_check)
+cc = st.session_state.cross_check.copy()
 cc["Difference"] = (cc["Entered Value"] - cc["Document Value"]).abs()
 cc["Status"] = cc["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
 mismatches = cc[cc["Status"] == "🚨 Mismatch"]
@@ -555,9 +755,15 @@ if page == "🏠 Dashboard":
                        {"range": [75, 100], "color": "#F89441"}]}))  # vibrant orange
         st.plotly_chart(fig, use_container_width=True)
     with c2:
-        cat_df = pd.DataFrame(list(score["categories"].items()), columns=["Category", "Score"])
-        fig2 = px.bar(cat_df, x="Score", y="Category", orientation="h", range_x=[0, 100],
-                      color="Score", color_continuous_scale="Plasma")
+        cat_df = pd.DataFrame([
+            {"Category": cat, "Points": val, "Max": score["category_max"][cat],
+             "Percent": round(val / score["category_max"][cat] * 100) if score["category_max"][cat] else 0,
+             "Label": f"{val}/{score['category_max'][cat]}"}
+            for cat, val in score["categories"].items()
+        ])
+        fig2 = px.bar(cat_df, x="Percent", y="Category", orientation="h", range_x=[0, 100],
+                      color="Percent", color_continuous_scale="Plasma", text="Label")
+        fig2.update_layout(xaxis_title="% of that category's max points")
         st.plotly_chart(fig2, use_container_width=True)
 
     st.subheader("Quick Summary")
@@ -621,9 +827,11 @@ elif page == "📊 Financial Health":
 elif page == "🔍 IPO Readiness":
     st.title("🔍 IPO Readiness Breakdown")
     st.metric("Overall IPO Readiness", f"{score['overall']} / 100")
+    st.caption("Each category has its own maximum weight, reflecting that some factors matter more than others.")
     for cat, val in score["categories"].items():
-        st.write(f"**{cat}**: {val}/100")
-        st.progress(val / 100)
+        max_pts = score["category_max"][cat]
+        st.write(f"**{cat}**: {val}/{max_pts}")
+        st.progress(val / max_pts if max_pts else 0)
 
 
 # ----------------------------------------------------------------------
@@ -659,55 +867,127 @@ elif page == "⚠️ Gap & Risk Detector":
     st.divider()
     st.subheader("🚨 Inconsistency Detector")
     st.caption(
-        "This is a **data-entry cross-check**, not a benchmark or target comparison — it checks that a "
-        "figure matches across two sources of the same historical fact:\n\n"
-        "- **Field** — the line item you're checking, e.g. `FY26 Revenue` or `FY26 Debt`.\n"
-        "- **Entered Value** — the number you already entered for that field in **⚙️ Data Input** (₹ Cr). "
-        "Not a benchmark or target — just the figure currently sitting in this app.\n"
-        "- **Document** — the same figure as it actually appears in the real source document "
-        "(financial statements, auditor's report, bank statement, RHP draft, etc.), in ₹ Cr.\n\n"
-        "*Example:* Field = `FY26 Revenue`, Entered Value = `50`, Document = `48` → flagged as a mismatch "
-        "of ₹2 Cr for you to verify."
+        "Enter the same figure as it appears in two different places — what you typed into the system "
+        "vs. what an uploaded document shows — and this table flags any mismatch automatically."
     )
     edited_cc = st.data_editor(
-        st.session_state.cross_check, num_rows="dynamic", use_container_width=True, key="gap_cross_check_editor",
-        column_config={
-            "Field": st.column_config.TextColumn(
-                "Field",
-                help="The line item you're cross-checking — e.g. 'FY26 Revenue' or 'FY26 Debt'.",
-            ),
-            "Entered Value": st.column_config.NumberColumn(
-                "Entered Value",
-                help="The figure you already entered for this field in ⚙️ Data Input (₹ Cr) — "
-                     "not a benchmark or target, just what's currently in the app.",
-            ),
-            "Document Value": st.column_config.NumberColumn(
-                "Document",
-                help="The same figure as it appears in the actual source document (financial "
-                     "statements, auditor's report, bank statement, etc.), in ₹ Cr.",
-            ),
-        },
+        st.session_state.cross_check, num_rows="dynamic", use_container_width=True, key="gap_cross_check_editor"
     )
     st.session_state.cross_check = edited_cc
 
-    cc_live = clean_cross_check(edited_cc)
+    cc_live = edited_cc.copy()
+    cc_live["Difference"] = (cc_live["Entered Value"] - cc_live["Document Value"]).abs()
+    cc_live["Status"] = cc_live["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
+    live_mismatches = cc_live[cc_live["Status"] == "🚨 Mismatch"]
 
-    if cc_live.empty:
-        st.info("Add a field name plus both an entered value and a document value to check for mismatches.")
+    if len(live_mismatches):
+        for _, row in live_mismatches.iterrows():
+            st.error(
+                f"Potential inconsistency in **{row['Field']}**: entered ₹{row['Entered Value']} Cr "
+                f"vs document ₹{row['Document Value']} Cr (difference ₹{row['Difference']:.1f} Cr). "
+                f"Status: Requires verification."
+            )
     else:
-        cc_live["Difference"] = (cc_live["Entered Value"] - cc_live["Document Value"]).abs()
-        cc_live["Status"] = cc_live["Difference"].apply(lambda d: "✅ Match" if d < 0.01 else "🚨 Mismatch")
-        live_mismatches = cc_live[cc_live["Status"] == "🚨 Mismatch"]
+        st.success("No inconsistencies detected across the checked fields.")
 
-        if len(live_mismatches):
-            for _, row in live_mismatches.iterrows():
-                st.error(
-                    f"Potential inconsistency in **{row['Field']}**: entered ₹{row['Entered Value']} Cr "
-                    f"vs document ₹{row['Document Value']} Cr (difference ₹{row['Difference']:.1f} Cr). "
-                    f"Status: Requires verification."
-                )
-        else:
-            st.success("No inconsistencies detected across the checked fields.")
+
+# ----------------------------------------------------------------------
+# PAGE: LEGAL, GOVERNANCE & VALUATION
+# ----------------------------------------------------------------------
+elif page == "⚖️ Legal, Governance & Valuation":
+    st.title("⚖️ Legal, Governance & Valuation")
+    st.caption(
+        "These checks cover areas real IPO due diligence looks at beyond the financial numbers. "
+        "This is still self-reported and simplified — it does not replace an actual legal or "
+        "audit review, and does not check SEBI's full eligibility rulebook."
+    )
+
+    st.subheader("Legal & Compliance")
+    st.caption("Answer honestly — 'Not disclosed' counts the same as an unresolved risk in the score.")
+    legal = st.session_state.legal_compliance
+    options_legal = ["Yes", "No", "Not disclosed"]
+    for item in list(legal.keys()):
+        legal[item] = st.selectbox(
+            item, options_legal, index=options_legal.index(legal[item]), key=f"legal_{item}"
+        )
+
+    st.divider()
+    st.subheader("Governance & Auditor Quality")
+    gov = st.session_state.governance_info
+    gov["auditor_name"] = st.text_input("Auditor name", gov["auditor_name"])
+    options_yn = ["Yes", "No", "Not disclosed"]
+    gov["auditor_is_reputable"] = st.selectbox(
+        "Is the auditor a reputable/well-established firm?", options_yn,
+        index=options_yn.index(gov["auditor_is_reputable"]),
+    )
+    gov["independent_directors_pct"] = st.number_input(
+        "Independent directors on the board (%)", 0, 100, gov["independent_directors_pct"]
+    )
+    gov["audit_committee_exists"] = st.selectbox(
+        "Does the company have a functioning audit committee?", options_yn,
+        index=options_yn.index(gov["audit_committee_exists"]),
+    )
+    gov["qualified_audit_opinion_last3yrs"] = st.selectbox(
+        "Any qualified audit opinion in the last 3 years? (a red flag if Yes)", options_yn,
+        index=options_yn.index(gov["qualified_audit_opinion_last3yrs"]),
+    )
+
+    st.divider()
+    st.subheader("Industry & Concentration Risk")
+    ind = st.session_state.industry_risk
+    ind["top_customer_concentration_pct"] = st.number_input(
+        "Revenue share from the single largest customer (%)", 0, 100,
+        ind["top_customer_concentration_pct"]
+    )
+    if ind["top_customer_concentration_pct"] > 25:
+        st.warning("⚠️ High customer concentration (>25% from one customer) is a common red flag in real due diligence.")
+    options_license = ["Obtained", "Pending", "Not Applicable", "Not disclosed"]
+    ind["key_regulatory_license_status"] = st.selectbox(
+        "Status of key industry-specific regulatory license/approval (if applicable)",
+        options_license, index=options_license.index(ind["key_regulatory_license_status"])
+    )
+    options_sentiment = ["Favorable", "Neutral", "Unfavorable", "Not assessed"]
+    ind["market_sentiment"] = st.selectbox(
+        "Current IPO market sentiment (informational only — not scored, since it's external "
+        "to the company)", options_sentiment, index=options_sentiment.index(ind["market_sentiment"])
+    )
+
+    st.divider()
+    st.subheader("📊 SEBI Eligibility Check (illustrative)")
+    st.caption(
+        "A pass/fail check against a few commonly-cited SME IPO criteria, computed directly from "
+        "your financial data — kept separate from the 0-100 score above since these are meant to "
+        "be closer to fixed regulatory thresholds, not weighted factors. This is NOT the complete "
+        "SEBI rulebook — verify actual eligibility with a merchant banker."
+    )
+    sebi_checks = check_sebi_eligibility(st.session_state.financials, ratios)
+    st.table(pd.DataFrame(sebi_checks).set_index("Requirement"))
+
+    st.divider()
+    st.subheader("💰 Valuation Estimator (illustrative)")
+    st.caption(
+        "A rough valuation range using your company's PAT and a peer P/E multiple — a real IPO "
+        "valuation involves far more (DCF models, EV/EBITDA, growth-adjusted multiples, banker "
+        "negotiation), so treat this as a conversation starter, not a valuation opinion."
+    )
+    val = st.session_state.valuation_info
+    val["peer_pe_multiple"] = st.number_input(
+        "Typical P/E multiple for similar companies in this industry", 0.0, 200.0,
+        float(val["peer_pe_multiple"]), step=0.5
+    )
+    if val["peer_pe_multiple"] > 0 and pd.notna(latest["PAT"]) and latest["PAT"] > 0:
+        low_pe = val["peer_pe_multiple"] * 0.8
+        high_pe = val["peer_pe_multiple"] * 1.2
+        low_val = latest["PAT"] * low_pe
+        high_val = latest["PAT"] * high_pe
+        st.metric("Estimated Pre-IPO Valuation Range",
+                   f"₹{low_val:.0f} Cr – ₹{high_val:.0f} Cr")
+        st.caption(
+            f"Based on PAT of ₹{latest['PAT']:.1f} Cr × a {low_pe:.1f}x–{high_pe:.1f}x P/E range "
+            f"(±20% around your entered peer multiple of {val['peer_pe_multiple']:.1f}x)."
+        )
+    else:
+        st.info("Enter a peer P/E multiple above, and make sure PAT is loaded, to see an estimated valuation range.")
 
 
 # ----------------------------------------------------------------------
@@ -930,6 +1210,18 @@ elif page == "⚙️ Data Input":
             if chosen.get("cross_check") is not None and not chosen["cross_check"].empty:
                 st.session_state.cross_check = chosen["cross_check"].copy()
                 extras_loaded.append(f"{len(chosen['cross_check'])} cross-check rows")
+            if chosen.get("legal_compliance"):
+                st.session_state.legal_compliance.update(chosen["legal_compliance"])
+                extras_loaded.append("legal & compliance info")
+            if chosen.get("governance_info"):
+                st.session_state.governance_info.update(chosen["governance_info"])
+                extras_loaded.append("governance info")
+            if chosen.get("industry_risk"):
+                st.session_state.industry_risk.update(chosen["industry_risk"])
+                extras_loaded.append("industry risk info")
+            if chosen.get("valuation_info"):
+                st.session_state.valuation_info.update(chosen["valuation_info"])
+                extras_loaded.append("valuation info")
             if extras_loaded:
                 st.info(f"Also loaded from the workbook: {', '.join(extras_loaded)}.")
             st.session_state.data_loaded = True
@@ -1017,6 +1309,18 @@ elif page == "⚙️ Data Input":
                     if parsed["cross_check"] is not None and not parsed["cross_check"].empty:
                         st.session_state.cross_check = parsed["cross_check"]
                         loaded_extras.append(f"{len(parsed['cross_check'])} cross-check rows")
+                    if parsed.get("legal_compliance"):
+                        st.session_state.legal_compliance.update(parsed["legal_compliance"])
+                        loaded_extras.append("legal & compliance info")
+                    if parsed.get("governance_info"):
+                        st.session_state.governance_info.update(parsed["governance_info"])
+                        loaded_extras.append("governance info")
+                    if parsed.get("industry_risk"):
+                        st.session_state.industry_risk.update(parsed["industry_risk"])
+                        loaded_extras.append("industry risk info")
+                    if parsed.get("valuation_info"):
+                        st.session_state.valuation_info.update(parsed["valuation_info"])
+                        loaded_extras.append("valuation info")
                     st.session_state.data_loaded = True
                     st.success(f"Loaded from {uploaded_file.name}: {', '.join(loaded_extras)}.")
                     st.dataframe(st.session_state.financials, use_container_width=True)
